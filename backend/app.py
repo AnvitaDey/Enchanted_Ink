@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict, Any
 
@@ -15,6 +16,7 @@ from typing import Optional, List, Dict, Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.trocr_htr import TrOCRService
+from models.google_htr_service import google_htr_service
 from models.memory_engine import EpisodicMemoryEngine
 from models.persona_engine import PersonaEngine
 from models.gemini_service import gemini_service
@@ -75,11 +77,11 @@ class BoardCommandRequest(BaseModel):
     @classmethod
     def bounded_board_context(cls, value):
         if value is not None:
-            if len(json.dumps(value, ensure_ascii=False)) > 24000:
-                raise ValueError("Board context exceeds 24 KB")
+            if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 1048576:
+                raise ValueError("Board context exceeds 1 MB")
             objects = value.get("objects", [])
-            if not isinstance(objects, list) or len(objects) > 40:
-                raise ValueError("Board context may include at most 40 objects")
+            if not isinstance(objects, list) or len(objects) > 1000:
+                raise ValueError("Board context may include at most 1000 objects")
         return value
 
 class BoardSaveRequest(BaseModel):
@@ -96,7 +98,7 @@ class BoardHTRRequest(BaseModel):
     canvas_width: int = 800
     canvas_height: int = 600
     request_id: Optional[str] = Field(default=None, max_length=100)
-    stroke_metadata: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=100)
+    stroke_metadata: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=1000)
     retry_model: bool = False
 
 @app.post("/api/board/command")
@@ -108,10 +110,11 @@ async def execute_board_command(req: BoardCommandRequest):
     if not req.command.strip():
         raise HTTPException(status_code=400, detail="Command cannot be empty.")
     parsed_command = extract_board_command(req.command)
-    if parsed_command["command_detected"]:
-        if parsed_command["instruction_missing"]:
-            raise HTTPException(status_code=400, detail="Please add an instruction after @board.")
-        req.command = f"@board {parsed_command['command_text']}"
+    if not parsed_command["command_detected"]:
+        raise HTTPException(status_code=400, detail="Start your request with @board to get a board response.")
+    if parsed_command["instruction_missing"]:
+        raise HTTPException(status_code=400, detail="Please add a question or instruction after @board.")
+    req.command = f"@board {parsed_command['command_text']}"
     if req.board_context and req.board_context.get("scope") == "selected" and not req.board_context.get("objects"):
         raise HTTPException(status_code=422, detail="Selected Objects scope requires at least one selected object.")
 
@@ -129,17 +132,52 @@ async def execute_board_command(req: BoardCommandRequest):
 @app.post("/api/board/htr")
 async def recognize_board_handwriting(req: BoardHTRRequest):
     """
-    Recognizes a cropped pen-stroke line with local TrOCR and reports any
-    constrained @board invocation separately from the transcription.
+    Uses a fine-tuned local TrOCR model when available, with Google Gemini
+    Vision as an external handwriting fallback when local recognition is weak.
     """
     request_id = req.request_id or uuid.uuid4().hex
     try:
         if not req.image_base64:
             return JSONResponse(status_code=400, content={"success": False, "status": "invalid_request",
-                "error": "A raster handwriting image is required by the TrOCR line model.", "request_id": request_id})
-        result = htr_engine.recognize(req.image_base64, force_retry=req.retry_model)
+                "error": "A raster handwriting image is required for recognition.", "request_id": request_id})
+        local_result = None
+        local_error = None
+        try:
+            local_result = await run_in_threadpool(
+                htr_engine.recognize, req.image_base64, force_retry=req.retry_model)
+        except ValueError:
+            raise
+        except RuntimeError as exc:
+            local_error = str(exc)
+
+        result = local_result
+        local_command = extract_board_command(local_result["transcription"]) if local_result else None
+        use_google_fallback = (google_htr_service.is_configured() and
+            (local_result is None or local_result.get("is_empty") or
+             local_result.get("model_source") != "fine_tuned" or
+             local_result.get("clarification_required") or not local_command["command_detected"]))
+        google_error = None
+        if use_google_fallback:
+            try:
+                result = await run_in_threadpool(google_htr_service.recognize, req.image_base64)
+            except ValueError:
+                raise
+            except RuntimeError as exc:
+                google_error = str(exc)
+                print(f"[BoardHTR:{request_id}] Google fallback failed: {google_error}")
+        if result is None:
+            details = "; ".join(error for error in (local_error, google_error) if error)
+            if not details:
+                details = "Install the HTR dependencies or configure GEMINI_API_KEY for Google handwriting recognition."
+            raise RuntimeError(details)
+
         command = extract_board_command(result["transcription"])
-        clarification = bool(result["clarification_required"])
+        # An explicit, leading @board trigger is the user's authorization for
+        # this constrained whiteboard action. Unscored baseline/Google text still
+        # asks for confirmation unless it contains that explicit trigger.
+        explicit_board_command = (result.get("model_source") in ("baseline", "google") and
+            command["command_detected"] and not command["instruction_missing"])
+        clarification = bool(result["clarification_required"] and not explicit_board_command)
         return JSONResponse(status_code=200, content={
             "success": True, "status": "recognized" if result["transcription"] else "empty",
             "text": result["transcription"], "confidence": result["calibrated_confidence"],
@@ -149,6 +187,8 @@ async def recognize_board_handwriting(req: BoardHTRRequest):
             "model_source": result.get("model_source"),
             "model_name": result.get("model_name"),
             "model_label": result.get("model_label"),
+            "recognizer": result.get("recognizer", "Local TrOCR"),
+            "recognition_warning": google_error,
             "command_detected": command["command_detected"],
             "command_text": command["command_text"],
             "instruction_missing": command["instruction_missing"],
@@ -224,7 +264,8 @@ async def get_board_config_status():
     return JSONResponse(content={
         "configured": board_ai_service.is_configured(),
         "provider": "Google Gemini",
-        "model": os.getenv("GEMINI_BOARD_MODEL", "gemini-3.8-flash")
+        "model": board_ai_service.model_name,
+        "fallback_model": board_ai_service.fallback_model or None
     })
 
 @app.post("/api/board/config/key")
@@ -334,8 +375,11 @@ async def process_turn(req: TurnRequest):
 @app.get("/api/v1/htr/status")
 async def get_htr_status():
     status = htr_engine.status()
-    status["inactivity_ms"] = max(500, min(10000, int(os.getenv("HTR_INACTIVITY_MS", "2200"))))
+    status["inactivity_ms"] = max(5000, min(15000, int(os.getenv("HTR_INACTIVITY_MS", "12000"))))
     status["retry_available"] = True
+    status["google_fallback_configured"] = google_htr_service.is_configured()
+    status["google_hwr_model"] = google_htr_service.model if google_htr_service.is_configured() else None
+    status["google_hwr_fallback_model"] = google_htr_service.fallback_model if google_htr_service.is_configured() else None
     return JSONResponse(content=status)
 
 @app.get("/api/v1/config/gemini-status")

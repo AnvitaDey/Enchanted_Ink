@@ -89,6 +89,20 @@ body, html {
   cursor: crosshair !important;
 }
 
+#canvasContainer .ink-preview-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  pointer-events: none;
+  touch-action: none;
+}
+
+#canvasContainer .upper-canvas {
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
 /* =========================================================================
    TOP NAVIGATION BAR
    ========================================================================= */

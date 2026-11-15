@@ -21,6 +21,8 @@ if (typeof fabric !== 'undefined' && fabric.util) {
   }
 }
 
+const BOARD_TRIGGER_PATTERN = /^\s*(?:@\s*b\s*[o0]\s*a\s*(?:r\s*)?[dtr]|at\s+b\s*[o0]\s*a\s*(?:r\s*)?[dtr])\b\s*[,.:;\-]?\s*/i;
+
 // =========================================================================
 // KRITA-INSPIRED DIGITAL INKING ENGINE (github.com/kde/krita)
 // Midpoint Quadratic Bézier Smoothing + Pointer Pressure + Strict Button Checks
@@ -34,23 +36,61 @@ class KritaInkingEngine {
     this.currentPointerId = null;
     this.rawPoints = [];
     this.smoothedPoints = [];
+    this.previewCanvas = null;
+    this.previewContext = null;
+    this.previewPixelRatio = 1;
 
+    this.createPreviewCanvas();
     this.bindEvents();
+  }
+
+  createPreviewCanvas() {
+    const wrapper = this.canvas.wrapperEl;
+    if (!wrapper) return;
+    const preview = document.createElement('canvas');
+    preview.className = 'ink-preview-canvas';
+    preview.setAttribute('aria-hidden', 'true');
+    wrapper.appendChild(preview);
+    this.previewCanvas = preview;
+    this.previewContext = preview.getContext('2d');
+    this.resizePreviewCanvas();
+  }
+
+  resizePreviewCanvas() {
+    if (!this.previewCanvas || !this.previewContext) return;
+    const rect = this.canvas.upperCanvasEl.getBoundingClientRect();
+    const ratio = window.devicePixelRatio || 1;
+    this.previewPixelRatio = ratio;
+    this.previewCanvas.style.width = `${rect.width}px`;
+    this.previewCanvas.style.height = `${rect.height}px`;
+    this.previewCanvas.width = Math.max(1, Math.round(rect.width * ratio));
+    this.previewCanvas.height = Math.max(1, Math.round(rect.height * ratio));
+    this.previewContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+
+  clearLivePreview() {
+    if (!this.previewCanvas || !this.previewContext) return;
+    this.previewContext.clearRect(
+      0, 0,
+      this.previewCanvas.width / this.previewPixelRatio,
+      this.previewCanvas.height / this.previewPixelRatio
+    );
   }
 
   bindEvents() {
     const el = this.canvas.upperCanvasEl;
     if (!el) return;
 
-    el.addEventListener('pointerdown', (e) => this.onPointerDown(e));
-    el.addEventListener('pointermove', (e) => this.onPointerMove(e));
+    el.style.touchAction = 'none';
+    el.addEventListener('pointerdown', (e) => this.onPointerDown(e), { passive: false });
+    el.addEventListener('pointermove', (e) => this.onPointerMove(e), { passive: false });
     el.addEventListener('pointerup', (e) => this.onPointerUp(e));
     el.addEventListener('pointercancel', (e) => this.onPointerUp(e));
     el.addEventListener('lostpointercapture', (e) => this.onPointerUp(e));
 
     // Global window release ensures stroke never gets stuck if mouse released outside canvas
     window.addEventListener('pointerup', (e) => {
-      if (this.isDrawing) this.finishStroke(e);
+      if (this.isDrawing && e.pointerId === this.currentPointerId) this.finishStroke(e);
     });
     window.addEventListener('blur', () => {
       if (this.isDrawing) this.finishStroke();
@@ -63,6 +103,7 @@ class KritaInkingEngine {
 
     // Disallow if spacebar held (panning) or if not the primary button (left click = 0)
     if (this.app.isSpacePressed || (e.button !== 0 && e.pointerType !== 'pen')) return;
+    if (e.cancelable) e.preventDefault();
 
     this.isDrawing = true;
     this.app.beginInkStroke();
@@ -83,14 +124,8 @@ class KritaInkingEngine {
   }
 
   onPointerMove(e) {
-    if (!this.isDrawing) return;
-
-    // CRITICAL FIX: If no button is pressed down (e.buttons === 0), terminate stroke immediately!
-    // This permanently prevents drawing while just moving the mouse without clicking.
-    if (e.buttons === 0) {
-      this.finishStroke(e);
-      return;
-    }
+    if (!this.isDrawing || e.pointerId !== this.currentPointerId) return;
+    if (e.cancelable) e.preventDefault();
 
     const pt = this.canvas.getPointer(e);
     const pressure = (e.pressure && e.pressure > 0) ? e.pressure : 0.5;
@@ -110,12 +145,12 @@ class KritaInkingEngine {
   }
 
   onPointerUp(e) {
-    if (!this.isDrawing) return;
+    if (!this.isDrawing || (e && e.pointerId !== this.currentPointerId)) return;
     this.finishStroke(e);
   }
 
   finishStroke(e) {
-    if (!this.isDrawing) return;
+    if (!this.isDrawing || (e && e.pointerId !== this.currentPointerId)) return;
     this.isDrawing = false;
 
     if (this.currentPointerId !== null) {
@@ -125,8 +160,9 @@ class KritaInkingEngine {
       this.currentPointerId = null;
     }
 
-    // Clear live preview from upper canvas
-    this.canvas.clearContext(this.canvas.contextTop);
+    // Fabric redraws its top canvas during pointer movement, so live ink lives
+    // on a separate transparent overlay until the permanent path is committed.
+    this.clearLivePreview();
 
     if (this.smoothedPoints.length < 1) return;
 
@@ -189,43 +225,47 @@ class KritaInkingEngine {
   }
 
   renderLive(points, isStart = false) {
-    const ctx = this.canvas.contextTop;
+    const ctx = this.previewContext;
     if (!ctx) return;
 
-    this.canvas.clearContext(ctx);
+    this.clearLivePreview();
     if (points.length < 1) return;
 
-    ctx.save();
-    this.canvas._saveAndTransform(ctx);
-
+    const transform = this.canvas.viewportTransform;
+    const zoom = transform[0] || 1;
+    const screenPoint = point => ({
+      x: point.x * zoom + transform[4],
+      y: point.y * zoom + transform[5]
+    });
+    const first = screenPoint(points[0]);
     const strokeColor = this.app.activeColor || '#4f46e5';
-    const strokeWidth = parseInt(this.app.activeStrokeWidth || 2) * 1.5;
+    const strokeWidth = parseInt(this.app.activeStrokeWidth || 2) * 1.5 * zoom;
 
     ctx.strokeStyle = strokeColor;
     ctx.fillStyle = strokeColor;
-    ctx.lineWidth = strokeWidth;
+    ctx.lineWidth = Math.max(0.75, strokeWidth);
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
     if (points.length === 1 || isStart) {
       ctx.beginPath();
-      ctx.arc(points[0].x, points[0].y, strokeWidth / 2, 0, Math.PI * 2);
+      ctx.arc(first.x, first.y, Math.max(0.75, strokeWidth / 2), 0, Math.PI * 2);
       ctx.fill();
     } else {
       ctx.beginPath();
-      ctx.moveTo(points[0].x, points[0].y);
+      ctx.moveTo(first.x, first.y);
       for (let i = 1; i < points.length - 1; i++) {
-        const xc = (points[i].x + points[i + 1].x) / 2;
-        const yc = (points[i].y + points[i + 1].y) / 2;
-        ctx.quadraticCurveTo(points[i].x, points[i].y, xc, yc);
+        const current = screenPoint(points[i]);
+        const next = screenPoint(points[i + 1]);
+        const xc = (current.x + next.x) / 2;
+        const yc = (current.y + next.y) / 2;
+        ctx.quadraticCurveTo(current.x, current.y, xc, yc);
       }
-      const last = points[points.length - 1];
-      const secondLast = points[points.length - 2];
+      const last = screenPoint(points[points.length - 1]);
+      const secondLast = screenPoint(points[points.length - 2]);
       ctx.quadraticCurveTo(secondLast.x, secondLast.y, last.x, last.y);
       ctx.stroke();
     }
-
-    ctx.restore();
   }
 }
 
@@ -259,11 +299,15 @@ class WhiteboardApp {
     this.boardName = 'Main Whiteboard';
     this.lastAiBatchId = null;
     this.lastAiSourceStrokes = [];
-    this.htrDebounceMs = 2200;
+    this.htrDebounceMs = 12000;
     this.htrDebounceTimer = null;
     this.pendingInkStrokes = [];
+    this.pendingCommandPrefixStrokes = [];
+    this.pendingCommandPrefixExpiresAt = 0;
     this.lastHtrStrokeGroup = [];
     this.htrBusy = false;
+    this.inkActivityVersion = 0;
+    this.googleHtrConfigured = false;
 
     this.init();
   }
@@ -327,6 +371,7 @@ class WhiteboardApp {
       if (this.canvas) {
         this.canvas.setWidth(window.innerWidth);
         this.canvas.setHeight(window.innerHeight);
+        this.kritaPen?.resizePreviewCanvas();
         this.canvas.renderAll();
       }
     });
@@ -939,8 +984,9 @@ class WhiteboardApp {
       if (!response.ok) return;
       const status = await response.json();
       if (Number.isFinite(status.inactivity_ms)) {
-        this.htrDebounceMs = Math.max(500, Math.min(10000, status.inactivity_ms));
+        this.htrDebounceMs = Math.max(5000, Math.min(15000, status.inactivity_ms));
       }
+      this.googleHtrConfigured = Boolean(status.google_fallback_configured);
     } catch (_) { /* Retain the safe local debounce default. */ }
   }
 
@@ -960,8 +1006,9 @@ class WhiteboardApp {
   }
 
   beginInkStroke() {
+    this.inkActivityVersion++;
     clearTimeout(this.htrDebounceTimer);
-    this.setHandwritingStatus('Writing detected. I’ll check this recent ink when you pause.');
+    this.setHandwritingStatus('Writing detected. I’ll wait until you pause; only an @board question gets a response.');
   }
 
   strokePointBounds(stroke) {
@@ -974,34 +1021,32 @@ class WhiteboardApp {
       height: Math.max(1, Math.max(...ys) - Math.min(...ys)) };
   }
 
-  strokesBelongTogether(first, next) {
-    const a = this.strokePointBounds(first);
-    const b = this.strokePointBounds(next);
-    if (!a || !b) return false;
-    const gapX = Math.max(0, a.left - b.right, b.left - a.right);
-    const centerA = (a.top + a.bottom) / 2;
-    const centerB = (b.top + b.bottom) / 2;
-    const lineHeight = Math.max(a.height, b.height, 24);
-    return gapX <= Math.max(420, Math.max(a.width, b.width) * 0.9) &&
-      Math.abs(centerA - centerB) <= lineHeight * 3.2 + 28;
-  }
-
   queueAutomaticHandwriting(stroke) {
     if (!stroke || !stroke.rawPoints?.length) return;
-    if (this.pendingInkStrokes.length &&
-        !this.strokesBelongTogether(this.pendingInkStrokes[this.pendingInkStrokes.length - 1], stroke)) {
-      const earlier = this.pendingInkStrokes;
-      this.pendingInkStrokes = [];
-      clearTimeout(this.htrDebounceTimer);
-      this.recognizeStrokeGroup(earlier, true);
+    if (Date.now() >= this.pendingCommandPrefixExpiresAt) {
+      this.pendingCommandPrefixStrokes = [];
+      this.pendingCommandPrefixExpiresAt = 0;
     }
-    this.pendingInkStrokes.push(stroke);
+    if (this.pendingCommandPrefixStrokes.length) {
+      this.mergePendingInkStrokes([...this.pendingCommandPrefixStrokes, stroke]);
+    } else {
+      this.pendingInkStrokes.push(stroke);
+    }
+    if (this.htrBusy) return;
+    this.scheduleAutomaticHandwriting();
+  }
+
+  scheduleAutomaticHandwriting(delay = this.htrDebounceMs) {
     clearTimeout(this.htrDebounceTimer);
     this.htrDebounceTimer = setTimeout(() => {
+      if (this.kritaPen?.isDrawing || this.htrBusy) {
+        this.scheduleAutomaticHandwriting(500);
+        return;
+      }
       const group = this.pendingInkStrokes;
       this.pendingInkStrokes = [];
       this.recognizeStrokeGroup(group, true);
-    }, this.htrDebounceMs);
+    }, delay);
   }
 
   rasterizeStrokeGroup(strokes) {
@@ -1050,17 +1095,26 @@ class WhiteboardApp {
   async recognizeStrokeGroup(strokes, automatic = false, forceRetry = false) {
     if (!strokes || !strokes.length) return;
     if (this.htrBusy) {
-      if (automatic) this.pendingInkStrokes.push(...strokes);
+      if (automatic) this.mergePendingInkStrokes(strokes);
       return;
     }
+    const activityVersion = this.inkActivityVersion;
     this.lastHtrStrokeGroup = strokes.slice();
     this.lastHtrAutomatic = automatic;
     this.htrBusy = true;
-    this.setHandwritingStatus('Recognising handwriting with the local TrOCR model…', { retryable: true });
+    if (automatic) {
+      document.getElementById('handwritingFeedback')?.classList.remove('visible');
+    } else {
+      this.setHandwritingStatus(this.googleHtrConfigured
+        ? 'Recognising handwriting; Google Gemini Vision is available as a fallback…'
+        : 'Recognising handwriting with the local TrOCR model…', { retryable: true });
+    }
     const requestId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : `htr_${Date.now()}`;
     try {
       const crop = this.rasterizeStrokeGroup(strokes);
-      this.setHandwritingStatus('Checking the recognized text for an @board command…', { retryable: true });
+      if (!automatic) {
+        this.setHandwritingStatus('Checking the recognized handwriting for an @board command…', { retryable: true });
+      }
       const response = await fetch('/api/board/htr', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image_base64: crop.imageBase64, canvas_width: crop.width,
@@ -1071,6 +1125,10 @@ class WhiteboardApp {
       let data;
       try { data = await response.json(); }
       catch (_) { throw new Error('The handwriting service returned an unreadable response.'); }
+      if (automatic && activityVersion !== this.inkActivityVersion) {
+        this.mergePendingInkStrokes(strokes);
+        return;
+      }
       if (!response.ok || !data.success) {
         const message = data.error || data.detail || 'Handwriting recognition failed.';
         if (data.status === 'unavailable' || response.status === 503) {
@@ -1082,8 +1140,10 @@ class WhiteboardApp {
       }
       const recognized = (data.text || '').trim();
       const modelNotice = data.model_label ? `${data.model_label}. ` : '';
+      const googleWarning = data.recognition_warning ?
+        `Google handwriting fallback unavailable: ${String(data.recognition_warning).slice(0, 180)}. ` : '';
       if (!recognized) {
-        this.setHandwritingStatus(`${modelNotice}Could not recognize handwriting. Your strokes remain on the board; retry or edit the transcription.`,
+        this.setHandwritingStatus(`${modelNotice}${googleWarning}Could not recognize handwriting. Your strokes remain on the board; retry or edit the transcription.`,
           { editable: true, retryable: true });
         return;
       }
@@ -1092,15 +1152,24 @@ class WhiteboardApp {
           this.replaceHandwritingWithText(strokes, crop.bounds, recognized);
           return;
         }
-        this.setHandwritingStatus(`${modelNotice}Text recognized, but no @board invocation was found. No AI command was sent. “${recognized}”`,
-          { editable: true, retryable: true, transcription: recognized });
+        if (this.pendingCommandPrefixStrokes.length) {
+          this.rememberPendingCommandPrefix(strokes);
+        }
+        document.getElementById('handwritingFeedback')?.classList.remove('visible');
         return;
       }
       if (data.instruction_missing) {
+        if (automatic) {
+          this.rememberPendingCommandPrefix(strokes);
+          document.getElementById('handwritingFeedback')?.classList.remove('visible');
+          return;
+        }
         this.setHandwritingStatus('I found @board, but no instruction followed it. What should I create or explain?',
           { editable: true, retryable: true, transcription: '@board ' });
         return;
       }
+      this.pendingCommandPrefixStrokes = [];
+      this.pendingCommandPrefixExpiresAt = 0;
       if (data.clarification_required) {
         const confidence = data.calibrated ? `Calibrated confidence ${Math.round(data.confidence * 100)}%.` :
           'Calibration is unavailable, so confirmation is required.';
@@ -1109,16 +1178,51 @@ class WhiteboardApp {
         return;
       }
       this.setHandwritingStatus(`${modelNotice}Command detected: ${data.command_text}. Generating board objects…`);
-      await this.executeAiCommand(`@board ${data.command_text}`, crop.bounds, strokes);
+      await this.executeAiCommand(`@board ${data.command_text}`, crop.bounds, strokes,
+        data.recognition_warning, automatic ? activityVersion : null);
     } catch (error) {
       this.setHandwritingStatus(`Could not recognize handwriting: ${error.message}. Your original ink is preserved.`,
         { editable: true, retryable: true });
     } finally {
       this.htrBusy = false;
       if (this.pendingInkStrokes.length) {
-        const next = this.pendingInkStrokes.splice(0);
-        this.htrDebounceTimer = setTimeout(() => this.recognizeStrokeGroup(next, true), this.htrDebounceMs);
+        this.scheduleAutomaticHandwriting();
       }
+    }
+  }
+
+  mergePendingInkStrokes(strokes) {
+    const merged = [];
+    const seen = new Set();
+    [...strokes, ...this.pendingInkStrokes].forEach(stroke => {
+      if (!seen.has(stroke)) {
+        seen.add(stroke);
+        merged.push(stroke);
+      }
+    });
+    this.pendingInkStrokes = merged.sort((a, b) => {
+      const aTime = Number(a.rawPoints?.[0]?.time) || 0;
+      const bTime = Number(b.rawPoints?.[0]?.time) || 0;
+      return aTime - bTime;
+    });
+  }
+
+  rememberPendingCommandPrefix(strokes) {
+    const seen = new Set();
+    this.pendingCommandPrefixStrokes = [...this.pendingCommandPrefixStrokes, ...strokes]
+      .filter(stroke => {
+        if (!stroke || seen.has(stroke)) return false;
+        seen.add(stroke);
+        return true;
+      });
+    this.pendingCommandPrefixStrokes.sort((a, b) => {
+      const aTime = Number(a.rawPoints?.[0]?.time) || 0;
+      const bTime = Number(b.rawPoints?.[0]?.time) || 0;
+      return aTime - bTime;
+    });
+    this.pendingCommandPrefixExpiresAt = Date.now() + 90000;
+    if (this.pendingInkStrokes.length) {
+      this.mergePendingInkStrokes(this.pendingCommandPrefixStrokes);
     }
   }
 
@@ -1137,26 +1241,24 @@ class WhiteboardApp {
   runCorrectedHandwritingCommand() {
     const field = document.getElementById('handwritingTranscription');
     const text = (field?.value || '').trim();
-    const trigger = /^\s*(?:@\s*b[o0]ard|at\s+board)\b\s*[,.:;\-]?\s*/i;
-    const match = text.match(trigger);
+    const match = text.match(BOARD_TRIGGER_PATTERN);
     if (!match) {
-      if (!this.lastHtrAutomatic && this.lastHtrStrokeGroup.length && text) {
-        const bounds = this.strokePointBounds(this.lastHtrStrokeGroup[0]) || { left: 40, top: 40 };
-        this.replaceHandwritingWithText(this.lastHtrStrokeGroup, { x: bounds.left, y: bounds.top }, text);
-        return;
-      }
-      this.setHandwritingStatus('Please start the corrected transcription with @board (or “at board”) so I know to run it. ',
+      this.setHandwritingStatus('No response sent. Start the question with @board to ask the board.',
         { editable: true, retryable: true, transcription: text });
       return;
     }
-    const instruction = text.slice(match[0].length).trim();
+    const instruction = (match ? text.slice(match[0].length) : text).trim();
     if (!instruction) {
       this.setHandwritingStatus('Please add an instruction after @board.',
         { editable: true, retryable: true, transcription: text });
       return;
     }
     this.setHandwritingStatus(`Confirmed command: ${instruction}. Sending it to the board service…`);
-    this.executeAiCommand(`@board ${instruction}`, null, this.lastHtrStrokeGroup);
+    const sourceStrokes = this.lastHtrStrokeGroup || [];
+    const insertionPoint = sourceStrokes.length
+      ? this.calculateHandwritingInsertionPoint(sourceStrokes)
+      : null;
+    this.executeAiCommand(`@board ${instruction}`, insertionPoint, sourceStrokes);
   }
 
   // =========================================================================
@@ -1193,7 +1295,8 @@ class WhiteboardApp {
     });
   }
 
-  async executeAiCommand(overrideCommand = null, overrideInsertionPoint = null, sourceStrokes = null) {
+  async executeAiCommand(overrideCommand = null, overrideInsertionPoint = null, sourceStrokes = null,
+                        recognitionWarning = null, recognitionVersion = null) {
     const input = document.getElementById('aiCommandInput');
     const submitBtn = document.getElementById('btnSubmitAiCommand');
 
@@ -1205,7 +1308,7 @@ class WhiteboardApp {
 
     // Normalize only explicit invocation variants; typed commands without a
     // prefix continue to be treated as commands by the command bar.
-    const invocation = command.match(/^\s*(?:@\s*b[o0]ard|at\s+board)\b\s*[,.:;\-]?\s*/i);
+    const invocation = command.match(BOARD_TRIGGER_PATTERN);
     command = invocation ? `@board ${command.slice(invocation[0].length).trim()}` : `@board ${command}`;
     if (command.trim().toLowerCase() === '@board') {
       this.setHandwritingStatus('I found @board, but no instruction followed it. What should I create or explain?',
@@ -1215,14 +1318,14 @@ class WhiteboardApp {
 
     // Determine scope and context
     const scopeSelect = document.getElementById('aiScopeSelect');
-    const scope = scopeSelect ? scopeSelect.value : 'all';
+    const scope = sourceStrokes?.length ? 'all' : (scopeSelect ? scopeSelect.value : 'all');
     if (scope === 'selected' && !this.canvas.getActiveObject() && !sourceStrokes?.length) {
       this.showAiNotification('Select one or more objects before using Selected Objects scope.', false);
       return;
     }
     const boardContext = this.extractBoardContext(scope === 'selected');
     if (scope === 'selected' && !this.canvas.getActiveObject() && sourceStrokes?.length) {
-      boardContext.objects = sourceStrokes.slice(0, 40).map(stroke => {
+      boardContext.objects = sourceStrokes.slice(0, 1000).map(stroke => {
         const bounds = this.strokePointBounds(stroke) || { left: 0, top: 0, width: 1, height: 1 };
         return { id: String(stroke.id || ''), type: 'path', text: '', x: bounds.left,
           y: bounds.top, width: bounds.width, height: bounds.height, selected: true };
@@ -1251,6 +1354,10 @@ class WhiteboardApp {
 
       let data;
       try { data = await response.json(); } catch (_) { throw new Error('The board service returned invalid JSON.'); }
+      if (recognitionVersion !== null && recognitionVersion !== this.inkActivityVersion) {
+        this.mergePendingInkStrokes(sourceStrokes || []);
+        return;
+      }
       if (!response.ok) throw new Error(data.detail || `Board request failed (${response.status}).`);
       if (!data || typeof data.batch_id !== 'string' || !data.batch_id ||
           !Array.isArray(data.objects) || data.objects.length === 0) {
@@ -1270,11 +1377,14 @@ class WhiteboardApp {
           this.lastHtrStrokeGroup = [];
         }
         const mode = data.provider_status === 'gemini' ? 'Gemini' :
-          (data.provider_status === 'fallback' ? 'Rule-based fallback' : 'Provider');
+          (data.provider_status === 'fallback' ? 'Rule-based fallback' :
+            (data.provider_status === 'local' ? 'Built-in illustration' : 'Provider'));
         const warning = data.warnings && data.warnings.length ? ` — ${data.warnings.join(' ')}` : '';
-        this.showAiNotification(`${mode}: ${data.summary || 'Objects added.'}${warning}`, true);
+        this.showAiNotification(`${mode}: ${data.summary || 'Objects added.'}${warning}`,
+          data.provider_status !== 'fallback');
         if (sourceStrokes?.length) {
-          this.setHandwritingStatus(`Completed: ${data.objects.length} editable objects placed. Provider: ${data.provider || mode}${data.fallback_used ? ' (fallback)' : ''}.`);
+          const warning = recognitionWarning ? ` Google handwriting service was unavailable: ${String(recognitionWarning).slice(0, 180)}.` : '';
+          this.setHandwritingStatus(`Completed: ${data.objects.length} editable objects placed. Provider: ${data.provider || mode}${data.fallback_used ? ' (fallback)' : ''}.${warning}`);
         }
         if (input && !overrideCommand) input.value = '';
       }
@@ -1339,15 +1449,24 @@ class WhiteboardApp {
       ? (active ? (active.type === 'activeSelection' ? active.getObjects() : [active]) : [])
       : objects;
 
-    targetList.slice(0, 40).forEach(obj => {
-      let t = '';
-      if (obj.text) t = obj.text;
-      else if (obj.isStickyNote && obj._objects && obj._objects[1]) t = obj._objects[1].text;
+    const collectText = (obj, depth = 0) => {
+      const pieces = [];
+      if (typeof obj.text === 'string' && obj.text.trim()) pieces.push(obj.text.trim());
+      if (typeof obj.title === 'string' && obj.title.trim()) pieces.push(obj.title.trim());
+      if (depth < 5 && Array.isArray(obj._objects)) {
+        obj._objects.forEach(child => pieces.push(collectText(child, depth + 1)));
+      }
+      return [...new Set(pieces.filter(Boolean))].join('\n');
+    };
+
+    targetList.forEach(obj => {
+      const text = collectText(obj);
       const bounds = obj.getBoundingRect(true, true);
       context.objects.push({ id: String(obj.id || ''), type: String(obj.type || 'unknown'),
-        text: String(t || '').trim().slice(0, 500), x: bounds.left, y: bounds.top,
+        text: String(text || '').trim().slice(0, 4000), x: bounds.left, y: bounds.top,
         width: bounds.width, height: bounds.height,
         from_id: obj.fromId || obj.from_id || null, to_id: obj.toId || obj.to_id || null,
+        title: String(obj.title || ''), label: String(obj.label || ''),
         selected: selectedOnly });
     });
 
@@ -1380,6 +1499,37 @@ class WhiteboardApp {
     const centerY = (-vpt[5] + this.canvas.height / 2) / zoom;
 
     return { x: Math.max(centerX - 300, 100), y: Math.max(centerY - 180, 100) };
+  }
+
+  calculateHandwritingInsertionPoint(strokes) {
+    const bounds = strokes.map(stroke => this.strokePointBounds(stroke)).filter(Boolean);
+    if (!bounds.length) return this.calculateSmartInsertionPoint();
+
+    const vpt = this.canvas.viewportTransform;
+    const zoom = vpt[0] || 1;
+    const viewLeft = -vpt[4] / zoom;
+    const viewTop = -vpt[5] / zoom;
+    const viewRight = (this.canvas.width - vpt[4]) / zoom;
+    const viewBottom = (this.canvas.height - vpt[5]) / zoom;
+    const contentLeft = Math.min(...bounds.map(item => item.left));
+    const contentTop = Math.min(...bounds.map(item => item.top));
+    const contentBottom = Math.max(...bounds.map(item => item.bottom));
+    const margin = 24;
+    const responseWidth = 380;
+    const responseHeight = 390;
+    const clamp = (value, min, max) => Math.max(min, Math.min(value, max));
+    const minX = viewLeft + margin;
+    const maxX = Math.max(minX, viewRight - responseWidth - margin);
+    const x = clamp(contentLeft, minX, maxX);
+    const minY = viewTop + margin;
+    const maxY = Math.max(minY, viewBottom - responseHeight - margin);
+
+    let y = contentBottom + margin;
+    if (y > maxY) {
+      const aboveInk = contentTop - responseHeight - margin;
+      y = aboveInk >= minY ? aboveInk : clamp(contentTop, minY, maxY);
+    }
+    return { x, y };
   }
 
   renderAiObjects(batchId, objectsData, summaryText) {

@@ -206,7 +206,7 @@ class TrOCRService:
             import torch
             pixel_values = self._processor(images=image, return_tensors="pt").pixel_values.to(self.device)
             with torch.inference_mode():
-                generated = self._model.generate(pixel_values, num_beams=1, max_new_tokens=128,
+                generated = self._model.generate(pixel_values, num_beams=1, max_new_tokens=256,
                                                   return_dict_in_generate=True, output_scores=True)
                 sequence = generated.sequences[0]
                 step_log_probs = []

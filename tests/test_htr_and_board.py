@@ -5,11 +5,13 @@ import math
 import os
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
 from models.trocr_htr import TrOCRService
-from models.board_ai_service import BoardAIService
+from models.google_htr_service import GoogleHandwritingRecognizer
+from models.board_ai_service import BoardAIService, WhiteboardObject
 from models.board_command_parser import extract_board_command
 from training.trocr_iam import writer_disjoint_split, fit_temperature, ece, prepare_manifest
 
@@ -69,7 +71,96 @@ class TrOCRServiceTests(unittest.TestCase):
             self.assertEqual(invalid.calibration_status, "invalid")
 
 
+class GoogleHandwritingRecognizerTests(unittest.TestCase):
+    def test_google_image_fallback_sends_inline_image_and_returns_transcript(self):
+        service = GoogleHandwritingRecognizer(api_key="test-key", model="gemini-test")
+        response = Mock(status_code=200)
+        response.json.return_value = {"steps": [{"type": "model_output", "content": [
+            {"type": "text", "text": "@board draw a login flowchart"}
+        ]}]}
+        with patch("models.google_htr_service.requests.post", return_value=response) as post:
+            result = service.recognize(data_url(Image.new("RGB", (120, 40), "white")))
+        self.assertEqual(result["transcription"], "@board draw a login flowchart")
+        self.assertEqual(result["recognizer"], "Google Gemini Vision")
+        self.assertEqual(result["model_source"], "google")
+        self.assertIsNone(result["calibrated_confidence"])
+        call = post.call_args
+        self.assertEqual(call.kwargs["headers"]["x-goog-api-key"], "test-key")
+        self.assertIn("/v1beta/interactions", call.args[0])
+        self.assertNotIn("api_key=", call.args[0])
+        image_part = call.kwargs["json"]["input"][1]
+        self.assertEqual(image_part["type"], "image")
+        self.assertEqual(image_part["mime_type"], "image/png")
+        self.assertTrue(image_part["data"])
+
+    def test_google_fallback_model_is_tried_after_primary_provider_error(self):
+        service = GoogleHandwritingRecognizer(api_key="test-key", model="gemini-primary")
+        primary = Mock(status_code=503)
+        primary.json.return_value = {"error": {"message": "temporarily unavailable"}}
+        backup = Mock(status_code=200)
+        backup.json.return_value = {"steps": [{"type": "model_output", "content": [
+            {"type": "text", "text": "@board draw a flowchart"}
+        ]}]}
+        with patch.dict(os.environ, {"GEMINI_HWR_FALLBACK_MODEL": "gemini-backup"}), \
+             patch("models.google_htr_service.requests.post", side_effect=[primary, backup]) as post:
+            result = service.recognize(data_url(Image.new("RGB", (120, 40), "white")))
+        self.assertEqual(result["model_name"], "gemini-backup")
+        self.assertEqual(post.call_count, 2)
+        self.assertNotIn("generationConfig", post.call_args.kwargs["json"])
+
+    def test_unconfigured_google_recognizer_does_not_make_request(self):
+        service = GoogleHandwritingRecognizer(api_key="")
+        with self.assertRaisesRegex(RuntimeError, "not configured"):
+            service.recognize(data_url(Image.new("RGB", (20, 20), "white")))
+
+
 class BoardAIServiceTests(unittest.TestCase):
+    def test_cat_drawing_uses_direct_editable_illustration(self):
+        service = BoardAIService()
+        service.api_key = "test-key"
+        with patch.object(service, "_call_gemini") as gemini:
+            result = service.generate_board_objects("@board draw a cat")
+        gemini.assert_not_called()
+        self.assertEqual(result.provider_status, "local")
+        self.assertEqual(result.provider, "Built-in illustration")
+        self.assertFalse(result.fallback_used)
+        self.assertIn("cat illustration", result.summary.lower())
+        self.assertGreaterEqual(len(result.objects), 8)
+        self.assertIn("ellipse", {item.type for item in result.objects})
+        self.assertIn("▲", {item.text for item in result.objects})
+        self.assertIn("cat_head", {item.id for item in result.objects})
+
+    def test_board_generation_retries_secondary_gemini_model(self):
+        service = BoardAIService()
+        service.api_key = "test-key"
+        service.model_name = "gemini-primary"
+        service.fallback_model = "gemini-backup"
+        primary_error = Mock(status_code=503)
+        primary_error.json.return_value = {"error": {"message": "temporarily unavailable"}}
+        backup_response = Mock(status_code=200)
+        backup_response.json.return_value = {"candidates": [{"content": {"parts": [{
+            "text": json.dumps({"summary": "A visible test label", "objects": [{
+                "id": "label", "type": "text", "x": 0, "y": 0,
+                "width": 180, "height": 40, "text": "External model worked"
+            }]})
+        }]}}]}
+        with patch("models.board_ai_service.requests.post", side_effect=[primary_error, backup_response]) as post:
+            result = service.generate_board_objects("@board create a label saying External model worked")
+        self.assertEqual(result.provider_status, "gemini")
+        self.assertEqual(result.model, "gemini-backup")
+        self.assertFalse(result.fallback_used)
+        self.assertEqual(len(result.objects), 1)
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("/v1beta/interactions", post.call_args.args[0])
+        self.assertEqual(post.call_args.kwargs["headers"]["x-goog-api-key"], "test-key")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "gemini-backup")
+        self.assertEqual(post.call_args.kwargs["json"]["response_format"]["mime_type"], "application/json")
+
+    def test_transparent_generated_colors_are_normalized_for_canvas(self):
+        item = WhiteboardObject(type="text", stroke="transparent", fill="transparent")
+        self.assertIsNone(item.stroke)
+        self.assertIsNone(item.fill)
+
     def test_typed_commands_are_labeled_as_fallback_when_offline(self):
         service = BoardAIService()
         service.api_key = ""

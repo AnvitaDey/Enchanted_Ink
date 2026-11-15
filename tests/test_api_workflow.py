@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app import app, htr_engine, persona_engine, board_ai_service
+from app import app, htr_engine, persona_engine, board_ai_service, google_htr_service
 from models.memory_engine import EpisodicMemoryEngine
 
 
@@ -15,9 +15,12 @@ class DiaryApiWorkflowTests(unittest.TestCase):
         self.client = TestClient(app)
         self.memory_patch = patch("app.memory_engine", self.memory)
         self.memory_patch.start()
+        self.google_htr_patch = patch.object(google_htr_service, "is_configured", return_value=False)
+        self.google_htr_patch.start()
 
     def tearDown(self):
         self.memory_patch.stop()
+        self.google_htr_patch.stop()
         self.temp_dir.cleanup()
 
     def test_low_confidence_does_not_reach_memory_or_reply(self):
@@ -61,6 +64,42 @@ class DiaryApiWorkflowTests(unittest.TestCase):
         self.assertEqual(response.json()["command_text"], "create a flowchart")
         self.assertEqual(response.json()["request_id"], "test-htr-1")
         self.assertTrue(response.json()["calibrated"])
+
+    def test_explicit_baseline_board_command_runs_without_calibration_gate(self):
+        with patch.object(htr_engine, "recognize", return_value={
+            "transcription": "@board create a flowchart for login",
+            "calibrated_confidence": None, "raw_confidence": 0.51,
+            "confidence_status": "baseline_uncalibrated", "clarification_required": True,
+            "model_source": "baseline", "model_name": "microsoft/trocr-small-handwritten",
+            "model_label": "PRETRAINED BASELINE — NOT ENCHANTED INK FINE-TUNED"
+        }):
+            response = self.client.post("/api/board/htr", json={"image_base64": "fixture"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["command_detected"])
+        self.assertFalse(response.json()["clarification_required"])
+        self.assertFalse(response.json()["calibrated"])
+
+    def test_google_handwriting_fallback_replaces_weak_local_baseline_result(self):
+        local_result = {
+            "transcription": "establishment .", "raw_confidence": 0.25,
+            "calibrated_confidence": None, "confidence_status": "baseline_uncalibrated",
+            "clarification_required": True, "is_empty": False, "model_source": "baseline"
+        }
+        google_result = {
+            "transcription": "@board draw a login flowchart", "raw_confidence": None,
+            "calibrated_confidence": None, "confidence_status": "google_unscored",
+            "clarification_required": True, "is_empty": False, "model_source": "google",
+            "model_name": "gemini-test", "model_label": "GOOGLE GEMINI EXTERNAL HANDWRITING RECOGNITION",
+            "recognizer": "Google Gemini Vision"
+        }
+        with patch.object(htr_engine, "recognize", return_value=local_result), \
+             patch.object(google_htr_service, "is_configured", return_value=True), \
+             patch.object(google_htr_service, "recognize", return_value=google_result):
+            response = self.client.post("/api/board/htr", json={"image_base64": "fixture"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["recognizer"], "Google Gemini Vision")
+        self.assertEqual(response.json()["command_text"], "draw a login flowchart")
+        self.assertFalse(response.json()["clarification_required"])
 
     def test_htr_missing_checkpoint_has_structured_unavailable_response(self):
         with patch.object(htr_engine, "recognize", side_effect=RuntimeError("TrOCR checkpoint is not configured")):

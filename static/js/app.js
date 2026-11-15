@@ -185,8 +185,14 @@ class EnchantedInkApp {
     try {
       const response = await fetch('/api/v1/htr/status');
       const status = await response.json();
-      if (status.available && status.model_source === 'baseline' && this.statusText) {
-        this.statusText.textContent = 'Handwriting ready with PRETRAINED BASELINE — NOT ENCHANTED INK FINE-TUNED. Please confirm each transcription.';
+      if (status.google_fallback_configured && this.statusText) {
+        const googleModel = status.google_hwr_model || 'Gemini Vision';
+        const backupModel = status.google_hwr_fallback_model ? ` with ${status.google_hwr_fallback_model} fallback` : '';
+        this.statusText.textContent = status.model_source === 'fine_tuned' && status.calibrated
+          ? `Handwriting uses local fine-tuned TrOCR with Google Gemini Vision (${googleModel}${backupModel}) fallback.`
+          : `Handwriting recognition uses Google Gemini Vision (${googleModel}${backupModel}); local TrOCR is the backup.`;
+      } else if (status.available && status.model_source === 'baseline' && this.statusText) {
+        this.statusText.textContent = 'Handwriting ready with PRETRAINED BASELINE — NOT ENCHANTED INK FINE-TUNED. Explicit @board commands run automatically; other text asks for confirmation.';
       } else if (status.loading && this.statusText) {
         this.statusText.textContent = 'Diary ready. Loading the local handwriting model…';
       } else if (!status.available && this.statusText) {

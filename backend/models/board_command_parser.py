@@ -3,14 +3,22 @@ import re
 from typing import Dict
 
 
-_TRIGGER = re.compile(r"^\s*(?:@\s*b[o0]ard|at\s+board)\b\s*[,.:;\-]?\s*", re.IGNORECASE)
+# OCR commonly confuses the last letters in "board" (for example, "boart"
+# or "boat") and may insert spaces between letters. Keep matching anchored to
+# the start so ordinary mentions of a board never become commands.
+_TRIGGER = re.compile(
+    r"^\s*(?:@\s*b\s*[o0]\s*a\s*(?:r\s*)?[dtr]|"
+    r"at\s+b\s*[o0]\s*a\s*(?:r\s*)?[dtr])\b\s*[,.:;\-]?\s*",
+    re.IGNORECASE,
+)
 
 
 def extract_board_command(text: str) -> Dict[str, object]:
     """Recognize only an invocation at the start of the transcription.
 
-    Accepts OCR's common ``@ board`` and spoken-form ``at board`` variants;
-    an unrelated occurrence of the word board is deliberately not a trigger.
+    Accepts spaced characters and common OCR substitutions in ``@board`` and
+    ``at board`` (including ``@boart`` and ``at boat``). An unrelated
+    occurrence of the word board is deliberately not a trigger.
     """
     transcription = (text or "").strip()
     match = _TRIGGER.match(transcription)

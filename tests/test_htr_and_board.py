@@ -256,6 +256,24 @@ class BoardAIServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing endpoint"):
             service.generate_board_objects("@board test")
 
+    def test_connector_geometry_is_derived_from_endpoints_not_model_dimensions(self):
+        service = BoardAIService()
+        service.api_key = ""
+        service._generate_fallback_response = lambda *_: {"summary": "connected nodes", "objects": [
+            {"id": "source", "type": "rectangle", "x": 0, "y": 0, "width": 100, "height": 80,
+             "text": "source"},
+            {"id": "target", "type": "rectangle", "x": 200, "y": 0, "width": 100, "height": 80,
+             "text": "target"},
+            {"id": "edge", "type": "arrow", "from_id": "source", "to_id": "target",
+             "x": 200, "y": 0, "width": -200, "height": -4},
+        ]}
+        result = service.generate_board_objects(
+            "@board connect the source to the target",
+            insertion_point={"x": 100, "y": 200},
+        )
+        arrow = next(item for item in result.objects if item.id == "edge")
+        self.assertEqual((arrow.x, arrow.y, arrow.width, arrow.height), (150, 240, 200, 0))
+
 
 class TrainingUtilityTests(unittest.TestCase):
     def test_iam_manifest_extraction_normalizes_word_delimiters(self):

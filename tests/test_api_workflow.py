@@ -147,11 +147,21 @@ class DiaryApiWorkflowTests(unittest.TestCase):
             "model_name": "gemini-test", "model_label": "GOOGLE GEMINI EXTERNAL HANDWRITING RECOGNITION",
             "recognizer": "Google Gemini Vision"
         }
-        with patch.object(htr_engine, "recognize", return_value=local_result), \
+        call_order = []
+        def recognize_locally(*args, **kwargs):
+            call_order.append("trocr")
+            return local_result
+
+        def recognize_with_google(*args, **kwargs):
+            call_order.append("google")
+            return google_result
+
+        with patch.object(htr_engine, "recognize", side_effect=recognize_locally), \
              patch.object(google_htr_service, "is_configured", return_value=True), \
-             patch.object(google_htr_service, "recognize", return_value=google_result):
+             patch.object(google_htr_service, "recognize", side_effect=recognize_with_google):
             response = self.client.post("/api/board/htr", json={"image_base64": "fixture"})
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(call_order, ["trocr", "google"])
         self.assertEqual(response.json()["recognizer"], "Google Gemini Vision")
         self.assertEqual(response.json()["command_text"], "draw a login flowchart")
         self.assertTrue(response.json()["clarification_required"])

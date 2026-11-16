@@ -256,10 +256,15 @@ class BoardAIService:
             if obj_id in node_map:
                 raise ValueError(f"Duplicate whiteboard object id: {obj_id}")
             payload = dict(raw_obj)
-            payload.update(id=obj_id, x=float(raw_obj.get("x", 0)) + target_x,
-                           y=float(raw_obj.get("y", 0)) + target_y,
-                           width=float(raw_obj.get("width", 160)),
-                           height=float(raw_obj.get("height", 80)), ai_batch_id=batch_id)
+            is_connector = raw_obj.get("type") in ("arrow", "connector")
+            payload.update(
+                id=obj_id,
+                x=0.0 if is_connector else float(raw_obj.get("x", 0)) + target_x,
+                y=0.0 if is_connector else float(raw_obj.get("y", 0)) + target_y,
+                width=0.0 if is_connector else float(raw_obj.get("width", 160)),
+                height=0.0 if is_connector else float(raw_obj.get("height", 80)),
+                ai_batch_id=batch_id,
+            )
             wb_obj = WhiteboardObject.model_validate(payload)
             if wb_obj.font_size is not None and not 8 <= wb_obj.font_size <= 72:
                 raise ValueError("font size must be between 8 and 72")

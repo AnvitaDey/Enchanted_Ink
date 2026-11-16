@@ -305,9 +305,12 @@ class WhiteboardApp {
     this.pendingCommandPrefixStrokes = [];
     this.pendingCommandPrefixExpiresAt = 0;
     this.lastHtrStrokeGroup = [];
+    this.lastHtrPreserveInk = false;
     this.htrBusy = false;
     this.inkActivityVersion = 0;
     this.googleHtrConfigured = false;
+    this.manualHtrNeedsBoardPrefix = false;
+    this.manualHtrConfirmationPending = false;
 
     this.init();
   }
@@ -970,7 +973,8 @@ class WhiteboardApp {
     });
     document.getElementById('btnRetryHandwriting')?.addEventListener('click', () => {
       if (this.lastHtrStrokeGroup.length) {
-        this.recognizeStrokeGroup(this.lastHtrStrokeGroup, this.lastHtrAutomatic, true);
+        this.recognizeStrokeGroup(this.lastHtrStrokeGroup, this.lastHtrAutomatic, true,
+          this.lastHtrPreserveInk);
       }
     });
     document.getElementById('btnRunCorrectedBoard')?.addEventListener('click', () => {
@@ -1092,15 +1096,22 @@ class WhiteboardApp {
       width: raster.width, height: raster.height };
   }
 
-  async recognizeStrokeGroup(strokes, automatic = false, forceRetry = false) {
+  async recognizeStrokeGroup(strokes, automatic = false, forceRetry = false, preserveInk = false) {
     if (!strokes || !strokes.length) return;
     if (this.htrBusy) {
       if (automatic) this.mergePendingInkStrokes(strokes);
+      else this.setHandwritingStatus('Handwriting recognition is already running. Wait for it to finish, then try again.',
+        { retryable: true });
       return;
     }
     const activityVersion = this.inkActivityVersion;
     this.lastHtrStrokeGroup = strokes.slice();
     this.lastHtrAutomatic = automatic;
+    this.lastHtrPreserveInk = preserveInk;
+    if (preserveInk) {
+      this.manualHtrNeedsBoardPrefix = false;
+      this.manualHtrConfirmationPending = false;
+    }
     this.htrBusy = true;
     if (automatic) {
       document.getElementById('handwritingFeedback')?.classList.remove('visible');
@@ -1147,9 +1158,23 @@ class WhiteboardApp {
           { editable: true, retryable: true });
         return;
       }
+      if (preserveInk) {
+        const commandInput = document.getElementById('aiCommandInput');
+        if (commandInput) commandInput.value = recognized;
+        this.canvas.discardActiveObject();
+        this.canvas.requestRenderAll();
+        this.manualHtrNeedsBoardPrefix = !data.command_detected;
+      }
       if (!data.command_detected) {
-        if (!automatic) {
+        if (!automatic && !preserveInk) {
           this.replaceHandwritingWithText(strokes, crop.bounds, recognized);
+          return;
+        }
+        if (preserveInk) {
+          this.setHandwritingStatus(
+            `${modelNotice}Recognized selected handwriting. Your original strokes are preserved. Add @board before an instruction and confirm to run it.`,
+            { editable: true, retryable: true, transcription: recognized }
+          );
           return;
         }
         if (this.pendingCommandPrefixStrokes.length) {
@@ -1159,6 +1184,11 @@ class WhiteboardApp {
         return;
       }
       if (data.instruction_missing) {
+        if (preserveInk) {
+          this.setHandwritingStatus('Recognized @board. Add an instruction in the command box, then send it.',
+            { editable: true, retryable: true, transcription: '@board ' });
+          return;
+        }
         if (automatic) {
           this.rememberPendingCommandPrefix(strokes);
           document.getElementById('handwritingFeedback')?.classList.remove('visible');
@@ -1170,6 +1200,14 @@ class WhiteboardApp {
       }
       this.pendingCommandPrefixStrokes = [];
       this.pendingCommandPrefixExpiresAt = 0;
+      if (preserveInk) {
+        this.manualHtrConfirmationPending = true;
+        const confidence = data.calibrated ? `Calibrated confidence ${Math.round(data.confidence * 100)}%.` :
+          'Calibration is unavailable, so confirmation is required.';
+        this.setHandwritingStatus(`${modelNotice}${confidence} Review the command in the chat box, then click send again or use Confirm & run command.`,
+          { editable: true, retryable: true, transcription: `@board ${data.command_text}` });
+        return;
+      }
       if (data.clarification_required) {
         const confidence = data.calibrated ? `Calibrated confidence ${Math.round(data.confidence * 100)}%.` :
           'Calibration is unavailable, so confirmation is required.';
@@ -1271,15 +1309,15 @@ class WhiteboardApp {
     const undoAiBtn = document.getElementById('btnUndoAiInsert');
     const dismissBannerBtn = document.getElementById('btnDismissAiBanner');
 
-    // Enter key submit
+    // Selected handwriting is recognized before the command bar submits text.
     input?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        this.executeAiCommand();
+        this.submitAiCommand();
       }
     });
 
-    submitBtn?.addEventListener('click', () => this.executeAiCommand());
+    submitBtn?.addEventListener('click', () => this.submitAiCommand());
     undoAiBtn?.addEventListener('click', () => this.undoLastAiInsert());
     dismissBannerBtn?.addEventListener('click', () => this.hideAiNotificationBanner());
 
@@ -1293,6 +1331,29 @@ class WhiteboardApp {
         }
       });
     });
+  }
+
+  submitAiCommand() {
+    if (this.getSelectedHandwritingStrokes().length) {
+      this.recognizeSelectedHandwriting();
+      return;
+    }
+    const input = document.getElementById('aiCommandInput');
+    const command = (input?.value || '').trim();
+    if (this.manualHtrConfirmationPending) {
+      const correction = document.getElementById('handwritingTranscription');
+      if (correction) correction.value = command;
+      this.runCorrectedHandwritingCommand();
+      return;
+    }
+    if (this.manualHtrNeedsBoardPrefix && !BOARD_TRIGGER_PATTERN.test(command)) {
+      this.setHandwritingStatus('This looks like a handwritten note, not a command. Add @board before an instruction to send it.',
+        { editable: true, retryable: true, transcription: command });
+      input?.focus();
+      return;
+    }
+    if (this.manualHtrNeedsBoardPrefix) this.manualHtrNeedsBoardPrefix = false;
+    this.executeAiCommand();
   }
 
   async executeAiCommand(overrideCommand = null, overrideInsertionPoint = null, sourceStrokes = null,
@@ -1375,6 +1436,9 @@ class WhiteboardApp {
           this.canvas.requestRenderAll();
           this.pushHistoryState();
           this.lastHtrStrokeGroup = [];
+          this.lastHtrPreserveInk = false;
+          this.manualHtrConfirmationPending = false;
+          this.manualHtrNeedsBoardPrefix = false;
         }
         const mode = data.provider_status === 'gemini' ? 'Gemini' :
           (data.provider_status === 'ollama' ? 'Ollama (local)' :
@@ -1794,19 +1858,33 @@ class WhiteboardApp {
   // =========================================================================
 
   async convertSelectedStrokesToText() {
-    const active = this.canvas.getActiveObject();
-    if (!active) {
-      alert('Please select the handwritten strokes on the canvas first.');
-      return;
-    }
-
-    const selectedList = active.type === 'activeSelection' ? active.getObjects() : [active];
-    const paths = selectedList.filter(obj => obj.type === 'path' || obj.isStroke);
+    const paths = this.getSelectedHandwritingStrokes();
     if (!paths.length) {
+      const active = this.canvas.getActiveObject();
+      if (!active) {
+        alert('Please select the handwritten strokes on the canvas first.');
+        return;
+      }
       this.setHandwritingStatus('Select one or more pen strokes to recognize or convert.');
       return;
     }
     this.recognizeStrokeGroup(paths, false);
+  }
+
+  getSelectedHandwritingStrokes() {
+    const active = this.canvas.getActiveObject();
+    if (!active) return [];
+    const selectedList = active.type === 'activeSelection' ? active.getObjects() : [active];
+    return selectedList.filter(obj => obj.type === 'path' || obj.isStroke);
+  }
+
+  recognizeSelectedHandwriting() {
+    const paths = this.getSelectedHandwritingStrokes();
+    if (!paths.length) {
+      this.setHandwritingStatus('Select one or more pen strokes on the canvas, then run detection again.');
+      return;
+    }
+    this.recognizeStrokeGroup(paths, false, false, true);
   }
 
   // =========================================================================

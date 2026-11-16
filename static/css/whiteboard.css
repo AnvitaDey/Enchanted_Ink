@@ -556,7 +556,6 @@ body, html {
 
 .ai-submit-btn:hover {
   background: var(--primary-hover);
-  transform: scale(1.05);
 }
 
 .ai-submit-btn:active {

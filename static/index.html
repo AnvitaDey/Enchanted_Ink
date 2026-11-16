@@ -271,14 +271,15 @@
   <div class="ai-command-container">
     <div class="ai-command-card">
       <div class="ai-badge">@board</div>
-      <input id="aiCommandInput" class="ai-input" type="text" placeholder="Ask AI to draw a flowchart, explain a system, summarize notes... (Press Enter or Ctrl+K)">
+      <input id="aiCommandInput" class="ai-input" type="text" placeholder="Ask AI... or press V, select handwriting, then click send to recognize">
       
       <select id="aiScopeSelect" class="ai-scope-select" title="Context Scope">
         <option value="all">Entire Board</option>
         <option value="selected">Selected Objects</option>
       </select>
 
-      <button id="btnSubmitAiCommand" class="ai-submit-btn" title="Submit @board command">
+      <button id="btnSubmitAiCommand" class="ai-submit-btn"
+        title="Select handwriting with V and drag, then click to recognize it; otherwise send @board command">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M5 12h14M12 5l7 7-7 7"/>
         </svg>

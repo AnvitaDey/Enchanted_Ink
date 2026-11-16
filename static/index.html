@@ -355,7 +355,7 @@
     </div>
   </div>
 
-  <!-- Settings / Gemini API Key Modal -->
+  <!-- AI Provider Settings -->
   <div id="settingsModal" class="modal-backdrop">
     <div class="modal-card">
       <div class="modal-header">
@@ -364,16 +364,30 @@
       </div>
       <div class="modal-body">
         <p style="font-size:13px;color:var(--text-secondary);line-height:1.4;">
-          Configure your Google Gemini API Key. Keys are stored locally on the server in <code>.env</code> and are never leaked to client assets.
+          Choose Google Gemini or Ollama. With the default local URL, prompts stay on your machine; a remote Ollama server receives the prompts you send it.
         </p>
-        <div>
-          <label style="font-size:12px;font-weight:600;display:block;margin-bottom:6px;">Gemini API Key</label>
-          <input id="inputApiKey" type="password" placeholder="AIzaSy..." style="width:100%;padding:8px 12px;border:1px solid var(--border-medium);border-radius:var(--radius-sm);font-size:14px;outline:none;">
+        <div style="margin-bottom:14px;">
+          <label for="aiProviderSelect" style="font-size:12px;font-weight:600;display:block;margin-bottom:6px;">AI provider</label>
+          <select id="aiProviderSelect" style="width:100%;padding:8px 12px;border:1px solid var(--border-medium);border-radius:var(--radius-sm);font-size:14px;">
+            <option value="gemini">Google Gemini (cloud)</option>
+            <option value="ollama">Ollama (local)</option>
+          </select>
         </div>
+        <div id="geminiProviderFields">
+          <label style="font-size:12px;font-weight:600;display:block;margin-bottom:6px;">Gemini API Key</label>
+          <input id="inputApiKey" type="password" placeholder="Enter your Gemini API key" autocomplete="off" style="width:100%;padding:8px 12px;border:1px solid var(--border-medium);border-radius:var(--radius-sm);font-size:14px;outline:none;">
+        </div>
+        <div id="ollamaProviderFields" style="display:none;">
+          <label for="ollamaBaseUrl" style="font-size:12px;font-weight:600;display:block;margin:10px 0 6px;">Ollama server URL</label>
+          <input id="ollamaBaseUrl" type="url" value="http://localhost:11434" style="width:100%;padding:8px 12px;border:1px solid var(--border-medium);border-radius:var(--radius-sm);font-size:14px;outline:none;">
+          <label for="ollamaModel" style="font-size:12px;font-weight:600;display:block;margin:10px 0 6px;">Installed model name</label>
+          <input id="ollamaModel" type="text" value="qwen2.5:7b" placeholder="e.g. qwen2.5:7b" style="width:100%;padding:8px 12px;border:1px solid var(--border-medium);border-radius:var(--radius-sm);font-size:14px;outline:none;">
+        </div>
+        <p id="aiProviderStatus" role="status" style="font-size:12px;color:var(--text-secondary);margin:12px 0 0;"></p>
       </div>
       <div class="modal-footer">
         <button class="btn-pill" data-modal-close>Cancel</button>
-        <button id="btnSaveApiKey" class="btn-pill primary">Save API Key</button>
+        <button id="btnSaveApiKey" class="btn-pill primary">Save Provider</button>
       </div>
     </div>
   </div>

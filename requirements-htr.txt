@@ -3,3 +3,4 @@
 transformers>=4.45,<5
 safetensors>=0.4
 sentencepiece>=0.2
+accelerate>=0.26.0

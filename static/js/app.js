@@ -172,7 +172,7 @@ class EnchantedInkApp {
       const res = await fetch('/api/v1/config/gemini-status');
       const data = await res.json();
       if (data.configured) {
-        if (this.geminiStatusLabel) this.geminiStatusLabel.textContent = "ACTIVE";
+        if (this.geminiStatusLabel) this.geminiStatusLabel.textContent = data.provider === 'ollama' ? "OLLAMA" : "ACTIVE";
       } else {
         if (this.geminiStatusLabel) this.geminiStatusLabel.textContent = "OFFLINE";
       }
@@ -300,12 +300,15 @@ class EnchantedInkApp {
       }
 
       if (this.clarificationBanner) this.clarificationBanner.classList.remove('active');
+      if (this.statusText && data.reply_source === 'ollama') {
+        this.statusText.textContent = 'Reply generated locally with Ollama...';
+      }
       // Clear the input only after a successful reply. Errors and clarifications
       // leave the original strokes available for correction or another attempt.
       this.canvasEngine.vanishInk();
       if (this.statusText) {
         this.statusText.textContent = data.reply_source === 'local_fallback'
-          ? `Local reply used${data.reply_warning ? `; Gemini unavailable: ${data.reply_warning}` : ''}.`
+          ? `Local reply used${data.reply_warning ? `; AI provider unavailable: ${data.reply_warning}` : ''}.`
           : "The diary answers in a flowing hand...";
       }
 

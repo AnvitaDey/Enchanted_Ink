@@ -2,6 +2,7 @@ import os
 import requests
 from typing import List, Dict, Optional
 from dotenv import load_dotenv, set_key
+from models.ai_provider import ai_provider_settings, ollama_service
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env")
 load_dotenv(ENV_PATH)
@@ -102,6 +103,29 @@ class GeminiDiaryService:
         """
         Calls Gemini API with chosen persona (Tom Riddle, Regular QA, etc.), dialogue history, and memories.
         """
+        if ai_provider_settings.provider == "ollama":
+            persona = PERSONA_PROMPTS.get(persona_id, PERSONA_PROMPTS["tom_riddle"])
+            messages = [{"role": "system", "content": persona["prompt"]}]
+            if history:
+                for turn in history[-5:]:
+                    user_text = turn.get("user_text", "")
+                    assistant_text = turn.get("ai_reply", "")
+                    if user_text and assistant_text:
+                        messages.extend([
+                            {"role": "user", "content": user_text},
+                            {"role": "assistant", "content": assistant_text},
+                        ])
+            memory_context = ""
+            if retrieved_memories:
+                recalled = "; ".join(
+                    memory["summary"] for memory in retrieved_memories[:2]
+                    if memory.get("summary")
+                )
+                if recalled:
+                    memory_context = f"\n[Remembered information from earlier pages: {recalled}]"
+            messages.append({"role": "user", "content": user_query + memory_context})
+            return ollama_service.chat(messages, timeout=90.0)
+
         if not self.is_configured():
             return None
 
@@ -192,4 +216,3 @@ class GeminiDiaryService:
         return None
 
 gemini_service = GeminiDiaryService()
-

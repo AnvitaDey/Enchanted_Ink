@@ -1,11 +1,13 @@
 import tempfile
 import unittest
+import os
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app import app, htr_engine, persona_engine, board_ai_service, google_htr_service
+from app import app, htr_engine, persona_engine, board_ai_service, google_htr_service, ai_provider_settings
 from models.memory_engine import EpisodicMemoryEngine
+from models.ai_provider import ollama_service
 
 
 class DiaryApiWorkflowTests(unittest.TestCase):
@@ -45,6 +47,34 @@ class DiaryApiWorkflowTests(unittest.TestCase):
         pages = self.memory.get_page_history()
         self.assertEqual(pages[0]["user_text"], "My corrected sentence")
 
+    def test_diary_uses_selected_ollama_provider(self):
+        with patch.dict(os.environ, {"AI_PROVIDER": "ollama", "OLLAMA_MODEL": "qwen2.5:7b"}), \
+             patch.object(ollama_service, "chat", return_value="A local answer from Ollama.") as chat:
+            response = self.client.post("/api/v1/process-turn", json={
+                "page_number": 5, "user_text_hint": "What is photosynthesis?",
+                "persona_id": "regular_qa"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["reply_source"], "ollama")
+        self.assertEqual(response.json()["ai_reply"], "A local answer from Ollama.")
+        chat.assert_called_once()
+
+    def test_ai_provider_settings_can_select_ollama(self):
+        ollama_status = {
+            "available": True, "model": "qwen2.5:7b",
+            "model_available": True, "error": None,
+        }
+        with patch.dict(os.environ, {"AI_PROVIDER": "ollama"}), \
+             patch.object(ai_provider_settings, "configure", return_value=True) as configure, \
+             patch.object(ollama_service, "status", return_value=ollama_status):
+            response = self.client.post("/api/ai/config", json={
+                "provider": "ollama", "ollama_base_url": "http://localhost:11434",
+                "ollama_model": "qwen2.5:7b"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["provider_id"], "ollama")
+        self.assertTrue(response.json()["configured"])
+        configure.assert_called_once_with(
+            "ollama", "http://localhost:11434", "qwen2.5:7b")
+
     def test_missing_model_returns_visible_service_error(self):
         if htr_engine.available:
             self.skipTest("A local model is configured; missing-checkpoint case does not apply")
@@ -65,7 +95,7 @@ class DiaryApiWorkflowTests(unittest.TestCase):
         self.assertEqual(response.json()["request_id"], "test-htr-1")
         self.assertTrue(response.json()["calibrated"])
 
-    def test_explicit_baseline_board_command_runs_without_calibration_gate(self):
+    def test_explicit_baseline_board_command_requires_confirmation(self):
         with patch.object(htr_engine, "recognize", return_value={
             "transcription": "@board create a flowchart for login",
             "calibrated_confidence": None, "raw_confidence": 0.51,
@@ -76,10 +106,35 @@ class DiaryApiWorkflowTests(unittest.TestCase):
             response = self.client.post("/api/board/htr", json={"image_base64": "fixture"})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["command_detected"])
-        self.assertFalse(response.json()["clarification_required"])
+        self.assertTrue(response.json()["clarification_required"])
         self.assertFalse(response.json()["calibrated"])
 
-    def test_google_handwriting_fallback_replaces_weak_local_baseline_result(self):
+    def test_disabling_google_hwr_fallback_keeps_baseline_local(self):
+        baseline_result = {
+            "transcription": "ordinary handwritten note",
+            "calibrated_confidence": None,
+            "raw_confidence": 0.42,
+            "confidence_status": "baseline_uncalibrated",
+            "clarification_required": True,
+            "is_empty": False,
+            "model_source": "baseline",
+            "model_name": "microsoft/trocr-small-handwritten",
+            "model_label": "PRETRAINED BASELINE — NOT ENCHANTED INK FINE-TUNED",
+        }
+        with patch.dict(os.environ, {"GEMINI_HWR_FALLBACK": "false"}), \
+             patch.object(htr_engine, "recognize", return_value=baseline_result), \
+             patch.object(google_htr_service, "recognize") as google_recognize:
+            response = self.client.post("/api/board/htr", json={"image_base64": "fixture"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["model_source"], "baseline")
+        self.assertEqual(response.json()["model_name"], "microsoft/trocr-small-handwritten")
+        self.assertFalse(response.json()["calibrated"])
+        self.assertIsNone(response.json()["confidence"])
+        self.assertEqual(response.json()["confidence_status"], "baseline_uncalibrated")
+        self.assertTrue(response.json()["clarification_required"])
+        google_recognize.assert_not_called()
+
+    def test_google_handwriting_fallback_replaces_weak_local_baseline_result_but_is_unscored(self):
         local_result = {
             "transcription": "establishment .", "raw_confidence": 0.25,
             "calibrated_confidence": None, "confidence_status": "baseline_uncalibrated",
@@ -99,7 +154,8 @@ class DiaryApiWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["recognizer"], "Google Gemini Vision")
         self.assertEqual(response.json()["command_text"], "draw a login flowchart")
-        self.assertFalse(response.json()["clarification_required"])
+        self.assertTrue(response.json()["clarification_required"])
+        self.assertFalse(response.json()["calibrated"])
 
     def test_htr_missing_checkpoint_has_structured_unavailable_response(self):
         with patch.object(htr_engine, "recognize", side_effect=RuntimeError("TrOCR checkpoint is not configured")):

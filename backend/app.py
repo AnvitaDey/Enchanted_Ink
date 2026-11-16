@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 # Ensure backend root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +20,7 @@ from models.google_htr_service import google_htr_service
 from models.memory_engine import EpisodicMemoryEngine
 from models.persona_engine import PersonaEngine
 from models.gemini_service import gemini_service
+from models.ai_provider import ai_provider_settings, ollama_service
 from models.board_command_parser import extract_board_command
 from models.board_storage import BoardStorage
 from models.board_ai_service import board_ai_service, BoardCommandResponse
@@ -172,12 +173,9 @@ async def recognize_board_handwriting(req: BoardHTRRequest):
             raise RuntimeError(details)
 
         command = extract_board_command(result["transcription"])
-        # An explicit, leading @board trigger is the user's authorization for
-        # this constrained whiteboard action. Unscored baseline/Google text still
-        # asks for confirmation unless it contains that explicit trigger.
-        explicit_board_command = (result.get("model_source") in ("baseline", "google") and
-            command["command_detected"] and not command["instruction_missing"])
-        clarification = bool(result["clarification_required"] and not explicit_board_command)
+        # Baseline and Google transcripts are uncalibrated; always confirm them
+        # before executing a handwritten board command.
+        clarification = bool(result["clarification_required"])
         return JSONResponse(status_code=200, content={
             "success": True, "status": "recognized" if result["transcription"] else "empty",
             "text": result["transcription"], "confidence": result["calibrated_confidence"],
@@ -261,17 +259,48 @@ async def delete_board(board_id: str):
 @app.get("/api/board/config/status")
 async def get_board_config_status():
     """Check AI provider configuration status."""
+    provider = ai_provider_settings.provider
+    ollama_status = await run_in_threadpool(ollama_service.status) if provider == "ollama" else None
+    configured = (bool(ollama_status and ollama_status["model_available"])
+                  if provider == "ollama" else board_ai_service.is_configured())
     return JSONResponse(content={
-        "configured": board_ai_service.is_configured(),
-        "provider": "Google Gemini",
-        "model": board_ai_service.model_name,
+        "configured": configured,
+        "provider": "Ollama (local)" if provider == "ollama" else "Google Gemini",
+        "provider_id": provider,
+        "model": ai_provider_settings.ollama_model if provider == "ollama" else board_ai_service.model_name,
+        "ollama_base_url": ai_provider_settings.ollama_base_url,
+        "ollama": ollama_status,
         "fallback_model": board_ai_service.fallback_model or None
     })
+
+class AIProviderConfigRequest(BaseModel):
+    provider: Literal["gemini", "ollama"]
+    ollama_base_url: str = Field(default="http://localhost:11434", min_length=1, max_length=500)
+    ollama_model: str = Field(default="qwen2.5:7b", min_length=1, max_length=128)
+    api_key: Optional[str] = Field(default=None, max_length=500)
+
+@app.post("/api/ai/config")
+async def configure_ai_provider(cfg: AIProviderConfigRequest):
+    """Persist the selected response provider and local Ollama settings."""
+    if cfg.api_key and cfg.api_key.strip():
+        if not board_ai_service.set_api_key(cfg.api_key):
+            raise HTTPException(status_code=500, detail="Failed to save Gemini API key.")
+        gemini_service.api_key = cfg.api_key.strip()
+    try:
+        saved = ai_provider_settings.configure(
+            cfg.provider, cfg.ollama_base_url, cfg.ollama_model)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not saved:
+        raise HTTPException(status_code=500, detail=ai_provider_settings.last_error)
+    return await get_board_config_status()
 
 @app.post("/api/board/config/key")
 async def set_board_api_key(cfg: Dict[str, str]):
     key = cfg.get("api_key", "").strip()
     success = board_ai_service.set_api_key(key)
+    if success:
+        gemini_service.api_key = key
     return JSONResponse(content={"status": "saved" if success else "failed", "configured": board_ai_service.is_configured()})
 
 
@@ -361,7 +390,12 @@ async def process_turn(req: TurnRequest):
             "retrieved_memories": memories,
             "debug": htr_result, "state": "completed",
             "reply_source": persona_engine.last_reply_source,
-            "reply_warning": gemini_service.last_error if persona_engine.last_reply_source != "gemini" else None
+            "reply_warning": (
+                ollama_service.last_error if persona_engine.last_reply_source == "local_fallback"
+                and ai_provider_settings.provider == "ollama" else
+                gemini_service.last_error if persona_engine.last_reply_source == "local_fallback"
+                else None
+            )
         })
     except RuntimeError as e:
         print(f"[ProcessTurn] HTR unavailable: {e}")
@@ -385,7 +419,20 @@ async def get_htr_status():
 @app.get("/api/v1/config/gemini-status")
 async def get_gemini_status():
     from models.gemini_service import gemini_service
-    return JSONResponse(content={"configured": gemini_service.is_configured()})
+    provider = ai_provider_settings.provider
+    if provider == "ollama":
+        status = await run_in_threadpool(ollama_service.status)
+        return JSONResponse(content={
+            "configured": status["model_available"],
+            "provider": provider,
+            "model": status["model"],
+            "error": status["error"],
+        })
+    return JSONResponse(content={
+        "configured": gemini_service.is_configured(),
+        "provider": provider,
+        "model": gemini_service.model_name,
+    })
 
 class KeyConfig(BaseModel):
     api_key: str

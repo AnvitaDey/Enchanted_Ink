@@ -2,6 +2,7 @@ import random
 import re
 from typing import List, Dict, Optional
 from models.gemini_service import gemini_service
+from models.ai_provider import ai_provider_settings
 
 PERSONAS = {
     "tom_riddle": {
@@ -41,7 +42,8 @@ class PersonaEngine:
         2. Otherwise, uses an advanced dynamic dialogue engine that never repeats previous turns.
         """
         # --- 1. Live Google Gemini LLM Integration ---
-        if gemini_service.is_configured():
+        provider = ai_provider_settings.provider
+        if provider == "ollama" or gemini_service.is_configured():
             try:
                 gemini_reply = gemini_service.generate_response(
                     user_query=user_query,
@@ -50,10 +52,10 @@ class PersonaEngine:
                     persona_id=persona_id
                 )
                 if gemini_reply and len(gemini_reply.strip()) > 0:
-                    self.last_reply_source = "gemini"
+                    self.last_reply_source = "ollama" if provider == "ollama" else "gemini"
                     return gemini_reply.strip()
             except Exception as e:
-                print(f"[PersonaEngine] Gemini call failed, using dynamic engine: {e}")
+                print(f"[PersonaEngine] {provider} call failed, using dynamic engine: {e}")
 
         # --- 2. Dynamic Context-Aware Fallback Engine ---
         self.last_reply_source = "local_fallback"

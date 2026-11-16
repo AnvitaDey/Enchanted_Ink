@@ -1377,8 +1377,9 @@ class WhiteboardApp {
           this.lastHtrStrokeGroup = [];
         }
         const mode = data.provider_status === 'gemini' ? 'Gemini' :
+          (data.provider_status === 'ollama' ? 'Ollama (local)' :
           (data.provider_status === 'fallback' ? 'Rule-based fallback' :
-            (data.provider_status === 'local' ? 'Built-in illustration' : 'Provider'));
+            (data.provider_status === 'local' ? 'Built-in illustration' : 'Provider')));
         const warning = data.warnings && data.warnings.length ? ` — ${data.warnings.join(' ')}` : '';
         this.showAiNotification(`${mode}: ${data.summary || 'Objects added.'}${warning}`,
           data.provider_status !== 'fallback');
@@ -2209,36 +2210,82 @@ class WhiteboardApp {
       const data = await resp.json();
       const dot = document.getElementById('geminiConfigDot');
       const label = document.getElementById('geminiConfigLabel');
+      const providerSelect = document.getElementById('aiProviderSelect');
+      const ollamaBaseUrl = document.getElementById('ollamaBaseUrl');
+      const ollamaModel = document.getElementById('ollamaModel');
+      const status = document.getElementById('aiProviderStatus');
       if (dot && label) {
         dot.className = data.configured ? 'save-dot' : 'save-dot unsaved';
-        label.textContent = data.configured ? 'AI Ready' : 'Configure API';
+        label.textContent = data.configured ? `${data.provider} Ready` : `Configure ${data.provider || 'AI'}`;
+      }
+      this.aiProviderConfigured = data.configured;
+      if (providerSelect && data.provider_id) providerSelect.value = data.provider_id;
+      if (ollamaBaseUrl && data.ollama_base_url) ollamaBaseUrl.value = data.ollama_base_url;
+      if (ollamaModel && data.provider_id === 'ollama' && data.model) ollamaModel.value = data.model;
+      if (status) {
+        status.textContent = data.provider_id === 'ollama'
+          ? (data.ollama?.model_available
+            ? `Ollama is ready with ${data.model}.`
+            : `${data.ollama?.error || 'Ollama is not ready.'} Start Ollama and install the selected model.`)
+          : (data.configured ? 'Gemini API key is configured.' : 'Enter a Gemini API key to use the cloud provider.');
       }
     } catch (e) {
-      console.warn('Failed to check Gemini status');
+      console.warn('Failed to check AI provider status');
     }
+
+    if (this.aiConfigEventsBound) return;
+    this.aiConfigEventsBound = true;
 
     document.getElementById('btnOpenSettings')?.addEventListener('click', () => {
       document.getElementById('settingsModal')?.classList.add('open');
     });
-
+    document.getElementById('aiProviderSelect')?.addEventListener('change', (event) => {
+      const useOllama = event.target.value === 'ollama';
+      document.getElementById('ollamaProviderFields').style.display = useOllama ? 'block' : 'none';
+      document.getElementById('geminiProviderFields').style.display = useOllama ? 'none' : 'block';
+    });
     document.getElementById('btnSaveApiKey')?.addEventListener('click', async () => {
       const keyInput = document.getElementById('inputApiKey');
       const key = keyInput ? keyInput.value.trim() : '';
-      if (!key) return;
+      const provider = document.getElementById('aiProviderSelect')?.value || 'gemini';
+      const status = document.getElementById('aiProviderStatus');
+      const saveButton = document.getElementById('btnSaveApiKey');
+      if (provider === 'gemini' && !key && !this.aiProviderConfigured) {
+        if (status) status.textContent = 'Enter a Gemini API key, or switch to Ollama for local inference.';
+        return;
+      }
+      if (saveButton) saveButton.disabled = true;
       try {
-        const resp = await fetch('/api/board/config/key', {
+        const resp = await fetch('/api/ai/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ api_key: key })
+          body: JSON.stringify({
+            provider,
+            api_key: key || null,
+            ollama_base_url: document.getElementById('ollamaBaseUrl')?.value.trim(),
+            ollama_model: document.getElementById('ollamaModel')?.value.trim()
+          })
         });
         const data = await resp.json();
-        if (data.status === 'saved') {
-          alert('Gemini API Key saved successfully!');
-          document.getElementById('settingsModal')?.classList.remove('open');
-          this.checkGeminiConfig();
+        if (!resp.ok) throw new Error(data.detail || 'Could not save provider settings.');
+        if (status) {
+          status.textContent = provider === 'ollama'
+            ? (data.ollama?.model_available
+              ? `Ollama is ready with ${data.model}.`
+              : `Settings saved, but ${data.ollama?.error || 'Ollama is not ready.'} Start Ollama and run: ollama pull ${data.model}`)
+            : 'Gemini provider selected. API key saved locally on the server.';
         }
+        const dot = document.getElementById('geminiConfigDot');
+        const label = document.getElementById('geminiConfigLabel');
+        this.aiProviderConfigured = data.configured;
+        if (dot) dot.className = data.configured ? 'save-dot' : 'save-dot unsaved';
+        if (label) label.textContent = data.configured ? `${data.provider} Ready` : `Configure ${data.provider}`;
+        if (data.configured) document.getElementById('settingsModal')?.classList.remove('open');
+        if (keyInput) keyInput.value = '';
       } catch (err) {
-        alert('Failed to save API key.');
+        if (status) status.textContent = err.message || 'Failed to save provider settings.';
+      } finally {
+        if (saveButton) saveButton.disabled = false;
       }
     });
 

@@ -1,3 +1,21 @@
+<<<<<<< HEAD
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+models/
+test_images/
+*.safetensors
+*.pt
+*.pth
+
+evaluation/iam_predictions.csv
+
+.env
+.vscode/
+.ipynb_checkpoints/
+=======
 .env
 .env.*
 !.env.example
@@ -9,3 +27,4 @@ models/trocr-iam/
 training-output/
 *.safetensors
 pytorch_model.bin
+>>>>>>> friend/main

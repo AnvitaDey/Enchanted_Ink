@@ -1,0 +1,7 @@
+transformers==4.57.3
+sentencepiece
+Pillow
+safetensors
+numpy
+pandas
+datasets
